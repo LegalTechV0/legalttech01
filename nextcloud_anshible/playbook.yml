@@ -1,0 +1,156 @@
+---
+- name: Fully automated deployment of Nextcloud AIO with Nginx reverse proxy
+  hosts: all
+  become: yes
+
+  vars:
+    docker_image: ghcr.io/nextcloud-releases/all-in-one:latest
+    domain_name: vaultra.ai
+    apache_port: 11000
+    nginx_config_http: /etc/nginx/sites-available/{{ domain_name }}_http
+    nginx_config_https: /etc/nginx/sites-available/{{ domain_name }}_https
+    nginx_enabled_path: /etc/nginx/sites-enabled/{{ domain_name }}
+    webroot_path: /var/www/html
+    dhparam_path: /etc/dhparam
+    email: legalteach373@gmail.com
+
+  tasks:
+    - name: ✨ Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+          - curl
+          - ca-certificates
+          - lsb-release
+          - apt-transport-https
+        state: present
+        update_cache: yes
+
+    - name: 🌟 Enable and start Docker
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: ❌ Remove default Nginx config
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: 📂 Ensure dhparam file exists
+      get_url:
+        url: https://ssl-config.mozilla.org/ffdhe2048.txt
+        dest: "{{ dhparam_path }}"
+        mode: '0644'
+
+    - name: 📊 Create HTTP-only Nginx config
+      copy:
+        dest: "{{ nginx_config_http }}"
+        content: |
+          server {
+              listen 80;
+              listen [::]:80;
+              server_name {{ domain_name }};
+
+              location /.well-known/acme-challenge/ {
+                  root {{ webroot_path }};
+              }
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ apache_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: 🔗 Enable Nginx site (HTTP-only)
+      file:
+        src: "{{ nginx_config_http }}"
+        dest: "{{ nginx_enabled_path }}"
+        state: link
+        force: yes
+
+    - name: 🔁 Reload Nginx (HTTP-only)
+      shell: nginx -t && systemctl reload nginx
+
+    - name: 🔐 Obtain SSL certificate
+      shell: |
+        certbot certonly --webroot \
+          -w {{ webroot_path }} \
+          -d {{ domain_name }} \
+          --agree-tos \
+          --email {{ email }} \
+          --non-interactive
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
+
+    - name: ♻️ Overwrite Nginx config with HTTPS
+      copy:
+        dest: "{{ nginx_config_https }}"
+        content: |
+          map $http_upgrade $connection_upgrade {
+              default upgrade;
+              '' close;
+          }
+
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl http2;
+              server_name {{ domain_name }};
+
+              ssl_certificate /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ domain_name }}/privkey.pem;
+              ssl_dhparam {{ dhparam_path }};
+
+              location / {
+                  proxy_pass http://127.0.0.1:{{ apache_port }};
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection $connection_upgrade;
+              }
+          }
+
+    - name: 🔗 Enable Nginx site (HTTPS)
+      file:
+        src: "{{ nginx_config_https }}"
+        dest: "{{ nginx_enabled_path }}"
+        state: link
+        force: yes
+
+    - name: 🔁 Reload Nginx (HTTPS)
+      shell: nginx -t && systemctl reload nginx
+
+    - name: 🚧 Stop and remove existing Nextcloud AIO mastercontainer
+      shell: |
+        docker stop nextcloud-aio-mastercontainer || true
+        docker rm nextcloud-aio-mastercontainer || true
+
+    - name: 🚀 Run Nextcloud AIO mastercontainer
+      shell: |
+        docker run \
+          --init \
+          --sig-proxy=false \
+          --name nextcloud-aio-mastercontainer \
+          --restart always \
+          --publish 8080:8080 \
+          --env APACHE_PORT={{ apache_port }} \
+          --env APACHE_IP_BINDING=0.0.0.0 \
+          --env SKIP_DOMAIN_VALIDATION=true \
+          --volume nextcloud_aio_mastercontainer:/mnt/docker-aio-config \
+          --volume /var/run/docker.sock:/var/run/docker.sock:ro \
+          {{ docker_image }}
