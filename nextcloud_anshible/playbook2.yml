@@ -17,10 +17,10 @@
     # AWS SES
     mail_from_address: no-reply
     mail_domain: vaultra.ai
-    smtp_host: email-smtp.eu-north-1.amazonaws.com
+    smtp_host: ""
     smtp_port: 465
-    smtp_user: AKIAUME6NBLZLPRIRCFR
-    smtp_pass: BHuymi3jf3+D9PzxiB2gaOswnerY2waJTqaENVwFdYWr
+    smtp_user: ""
+    smtp_pass: ""
 
   tasks:
     - name: Install required packages
