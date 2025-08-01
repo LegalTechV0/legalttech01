@@ -1,0 +1,7 @@
+- name: Patch Nextcloud user limit return
+  hosts: localhost
+  become: true
+  tasks:
+    - name: Replace 'return $userLimitReached;' with 'return false;' in delegateIsHardUserLimitReached
+      shell: |
+        docker exec nextcloud-aio-nextcloud sed -i 's/return \$userLimitReached;/return false;/' /var/www/html/lib/private/Support/Subscription/Registry.php
