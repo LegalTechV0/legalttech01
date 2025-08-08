@@ -1,0 +1,167 @@
+---
+- name: Setup Lago with Docker, Nginx, and SSL
+  hosts: all
+  become: yes
+
+  vars:
+    domain: "lago.vaultra.ai"
+    front_port: "8888"
+    lago_dir: "/home/ubuntu/lago"
+    docker_compose_path: "/home/ubuntu/.docker/cli-plugins/docker-compose"
+
+  tasks:
+    - name: Install required apt packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker apt repository
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable"
+        filename: docker
+        state: present
+
+    - name: Install Docker Engine
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        update_cache: yes
+
+    - name: Create Docker CLI plugin directory
+      file:
+        path: "{{ docker_compose_path | dirname }}"
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker Compose plugin
+      get_url:
+        url: https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64
+        dest: "{{ docker_compose_path }}"
+        mode: '0755'
+
+    - name: Remove existing Lago folder if present
+      file:
+        path: "{{ lago_dir }}"
+        state: absent
+
+    - name: Clone Lago repository without submodules
+      git:
+        repo: https://github.com/getlago/lago.git
+        dest: "{{ lago_dir }}"
+        clone: yes
+        update: yes
+        recursive: no
+
+    - name: Rewrite submodule URLs to use HTTPS and update submodules
+      shell: |
+        git config -f .gitmodules submodule.api.url https://github.com/getlago/lago-api.git
+        git config -f .gitmodules submodule.front.url https://github.com/getlago/lago-front.git
+        git submodule sync
+        git submodule update --init --recursive
+      args:
+        chdir: "{{ lago_dir }}"
+
+    - name: Generate RSA private key
+      shell: openssl genrsa 2048 | base64
+      register: rsa_key
+
+    - name: Set Lago RSA private key in .env
+      lineinfile:
+        path: "{{ lago_dir }}/.env"
+        line: "LAGO_RSA_PRIVATE_KEY=\"{{ rsa_key.stdout }}\""
+        create: yes
+
+    - name: Change frontend port to 8888
+      lineinfile:
+        path: "{{ lago_dir }}/.env"
+        regexp: '^FRONT_PORT=.*'
+        line: "FRONT_PORT={{ front_port }}"
+        create: yes
+
+    - name: Add optional environment variables to .env
+      blockinfile:
+        path: "{{ lago_dir }}/.env"
+        block: |
+         LAGO_DISABLE_SEGMENT=true
+         LAGO_DISABLE_WALLET_REFRESH=true
+         LAGO_SIGNUP_ALLOWED=true
+         LAGO_API_URL=https://{{ domain }}/api
+         LAGO_FRONT_URL=https://{{ domain }}
+
+    - name: Start Lago with Docker Compose
+      command: "{{ docker_compose_path }} up -d"
+      args:
+        chdir: "{{ lago_dir }}"
+      environment:
+        DOCKER_CLI_EXPERIMENTAL: enabled
+
+    - name: Create Nginx config for Lago with SSL redirection
+      copy:
+        dest: "/etc/nginx/sites-available/lago"
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain }};
+              return 301 https://$host$request_uri;
+          }
+
+          server {
+              listen 443 ssl;
+              server_name {{ domain }};
+
+              ssl_certificate /etc/letsencrypt/live/{{ domain }}/fullchain.pem;
+              ssl_certificate_key /etc/letsencrypt/live/{{ domain }}/privkey.pem;
+
+              location / {
+                  proxy_pass http://localhost:{{ front_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+
+              location /api/ {
+                  proxy_pass http://localhost:3000/;
+                  proxy_http_version 1.1;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: "/etc/nginx/sites-available/lago"
+        dest: "/etc/nginx/sites-enabled/lago"
+        state: link
+        force: yes
+
+    - name: Remove default site if exists
+      file:
+        path: "/etc/nginx/sites-enabled/default"
+        state: absent
+
+    - name: Reload Nginx to apply new config
+      shell: nginx -t && systemctl reload nginx
+
+    - name: Obtain SSL certificate with Certbot
+      shell: certbot certonly --nginx --non-interactive --agree-tos -m admin@{{ domain }} -d {{ domain }}
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
