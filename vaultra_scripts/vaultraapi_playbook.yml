@@ -1,0 +1,100 @@
+---
+- name: Setup Node.js Express app with PM2, Nginx, and SSL
+  hosts: all
+  become: true
+
+  vars:
+    app_dir: /home/ubuntu/vaultraapi
+    domain_name: api.vaultra.ai
+    app_port: 3030
+    email: admin@vaultra.ai   # Email for Let's Encrypt notifications
+
+  tasks:
+    - name: Update apt
+      apt:
+        update_cache: yes
+
+    - name: Install Node.js and npm
+      apt:
+        name:
+          - nodejs
+          - npm
+        state: present
+
+    - name: Install PM2 globally
+      npm:
+        name: pm2
+        global: yes
+
+    - name: Install Nginx and Certbot
+      apt:
+        name:
+          - nginx
+          - python3-certbot-nginx
+        state: present
+
+    - name: Ensure correct permissions for app folder
+      file:
+        path: "{{ app_dir }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+        recurse: yes
+
+    - name: Install app dependencies
+      npm:
+        path: "{{ app_dir }}"
+        production: yes
+
+    - name: Start the app with PM2 and enable watch mode
+      shell: |
+        pm2 delete vaultraapi || true
+        pm2 start {{ app_dir }}/server.js --name vaultraapi --watch
+        pm2 save
+        pm2 startup systemd -u ubuntu --hp /home/ubuntu
+      args:
+        executable: /bin/bash
+
+    - name: Configure Nginx for {{ domain_name }}
+      copy:
+        dest: /etc/nginx/sites-available/{{ domain_name }}
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }};
+
+              location / {
+                  proxy_pass http://localhost:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/{{ domain_name }}
+        dest: /etc/nginx/sites-enabled/{{ domain_name }}
+        state: link
+        force: yes
+
+    - name: Remove default Nginx config
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Obtain and install Let's Encrypt SSL certificate
+      command: >
+        certbot --nginx -d {{ domain_name }}
+        --non-interactive --agree-tos
+        --email {{ email }}
+        --redirect
+      args:
+        creates: /etc/letsencrypt/live/{{ domain_name }}/fullchain.pem
