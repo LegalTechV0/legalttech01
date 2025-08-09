@@ -1,0 +1,124 @@
+---
+- name: Fully deploy vaultra.ai and www.vaultra.ai with SSL (no interference)
+  hosts: all
+  become: true
+
+  vars:
+    domain_name: vaultra.ai
+    webroot_path: /var/www/vaultra.ai/html
+    email: admin@vaultra.ai
+
+  tasks:
+    - name: Install required packages (Nginx + Certbot)
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - nginx
+        - certbot
+        - python3-certbot-nginx
+        - acl
+
+    - name: Create web root directory
+      file:
+        path: "{{ webroot_path }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+        recurse: yes
+
+    - name: Copy index.html from /tmp
+      copy:
+        src: /tmp/index.html
+        dest: "{{ webroot_path }}/index.html"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+        remote_src: yes
+
+    - name: Copy buy.html from /tmp
+      copy:
+        src: /tmp/buy.html
+        dest: "{{ webroot_path }}/buy.html"
+        owner: www-data
+        group: www-data
+        mode: '0644'
+        remote_src: yes
+
+    - name: Copy feature images from /tmp/src_img
+      copy:
+        src: /tmp/src_img/
+        dest: "{{ webroot_path }}/src_img/"
+        owner: www-data
+        group: www-data
+        mode: preserve
+        remote_src: yes
+
+    - name: Ensure images have correct permissions
+      file:
+        path: "{{ webroot_path }}/src_img"
+        state: directory
+        recurse: yes
+        owner: www-data
+        group: www-data
+        mode: '0755'
+
+    - name: Set permissions for individual image files
+      shell: |
+        find "{{ webroot_path }}/src_img" -type f -exec chmod 644 {} \;
+        find "{{ webroot_path }}/src_img" -type f -exec chown www-data:www-data {} \;
+      args:
+        executable: /bin/bash
+
+    - name: Create combined Nginx config for vaultra.ai and www.vaultra.ai if missing
+      copy:
+        dest: /etc/nginx/sites-available/vaultra.ai
+        content: |
+          server {
+              listen 80;
+              server_name {{ domain_name }} www.{{ domain_name }};
+
+              root {{ webroot_path }};
+              index index.html;
+
+              location / {
+                  try_files $uri $uri.html $uri/ =404;
+              }
+          }
+      when: not (ansible_facts['files'] is defined and '/etc/nginx/sites-available/vaultra.ai' in ansible_facts['files'])
+
+    - name: Enable vaultra.ai site
+      file:
+        src: /etc/nginx/sites-available/vaultra.ai
+        dest: /etc/nginx/sites-enabled/vaultra.ai
+        state: link
+        force: yes
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      register: nginx_test
+      changed_when: false
+
+    - name: Reload Nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: Obtain (or expand) SSL certificate for both domains
+      command: >
+        certbot --nginx --non-interactive --agree-tos --redirect
+        --email {{ email }} -d {{ domain_name }} -d www.{{ domain_name }} --expand
+      register: certbot_output
+      changed_when: "'Congratulations' in certbot_output.stdout or 'no action taken' in certbot_output.stdout"
+
+    - name: Final Nginx reload
+      service:
+        name: nginx
+        state: reloaded
